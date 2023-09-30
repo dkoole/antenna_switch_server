@@ -24,7 +24,7 @@
 
 #include "esp_vfs.h"
 #include "esp_spiffs.h"
-#include "esp_http_server.h"
+#include <esp_http_server.h>
 
 /* Max length a file path can have on storage */
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
@@ -39,6 +39,8 @@ struct file_server_data {
     /* Scratch buffer for temporary storage during file transfer */
     char scratch[SCRATCH_BUFSIZE];
 };
+
+static httpd_handle_t ws_server = NULL;
 
 static const char *TAG = "antenna_switch";
 
@@ -93,6 +95,83 @@ static const char* get_path_from_uri(char *dest, const char *base_path, const ch
 
     /* Return pointer to path, skipping the base */
     return dest + base_pathlen;
+}
+
+
+esp_err_t httpd_ws_send_frame_to_all_clients(httpd_ws_frame_t *ws_pkt) {
+    // static const size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
+    // size_t fds = max_clients;
+    size_t fds = CONFIG_LWIP_MAX_LISTENING_TCP;
+    int client_fds[CONFIG_LWIP_MAX_LISTENING_TCP] = {0};
+
+    esp_err_t ret = httpd_get_client_list(ws_server, &fds, client_fds);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    for (int i = 0; i < fds; i++) {
+        int client_info = httpd_ws_get_fd_info(ws_server, client_fds[i]);
+        if (client_info == HTTPD_WS_CLIENT_WEBSOCKET) {
+            httpd_ws_send_frame_async(ws_server, client_fds[i], ws_pkt);
+        }
+    }
+
+    return ESP_OK;
+}
+
+/*
+ * This handler echos back the received ws data
+ * and triggers an async send if certain message received
+ */
+static esp_err_t echo_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "Handshake done, the new connection was opened");
+        return ESP_OK;
+    }
+    httpd_ws_frame_t ws_pkt;
+    uint8_t *buf = NULL;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    /* Set max_len = 0 to get the frame len */
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
+        return ret;
+    }
+    ESP_LOGI(TAG, "frame len is %d", ws_pkt.len);
+    if (ws_pkt.len) {
+        /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
+        buf = calloc(1, ws_pkt.len + 1);
+        if (buf == NULL) {
+            ESP_LOGE(TAG, "Failed to calloc memory for buf");
+            return ESP_ERR_NO_MEM;
+        }
+        ws_pkt.payload = buf;
+        /* Set max_len = ws_pkt.len to get the frame payload */
+        ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
+            free(buf);
+            return ret;
+        }
+        ESP_LOGI(TAG, "Got packet with message: %s", ws_pkt.payload);
+    }
+    ESP_LOGI(TAG, "Packet type: %d", ws_pkt.type);
+    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
+        strcmp((char*)ws_pkt.payload,"ant4") == 0) {
+        free(buf);
+        // return trigger
+        return httpd_ws_send_frame_to_all_clients(&ws_pkt);
+    }
+
+    ret = httpd_ws_send_frame(req, &ws_pkt);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ws_send_frame failed with %d", ret);
+    }
+    free(buf);
+    return ret;
 }
 
 /* Handler to download a file kept on the server */
@@ -211,7 +290,28 @@ esp_err_t example_start_file_server(const char *base_path)
         .handler   = download_get_handler,
         .user_ctx  = server_data    // Pass server data as context
     };
+
     httpd_register_uri_handler(server, &file_download);
+
+    httpd_config_t ws_config = HTTPD_DEFAULT_CONFIG();
+    ws_config.ctrl_port = 114;
+    ws_config.server_port = 8083;
+
+    ESP_LOGI(TAG, "Starting Websocket Server on port: '%d'", ws_config.server_port);
+    if (httpd_start(&ws_server, &ws_config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start websocket server!");
+        return ESP_FAIL;
+    }
+
+    httpd_uri_t ws = {
+        .uri        = "/ws",
+        .method     = HTTP_GET,
+        .handler    = echo_handler,
+        .user_ctx   = NULL,
+        .is_websocket = true
+    };
+
+    httpd_register_uri_handler(ws_server, &ws);
 
     return ESP_OK;
 }
