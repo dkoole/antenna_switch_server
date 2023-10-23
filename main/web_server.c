@@ -40,9 +40,9 @@ struct file_server_data {
     char scratch[SCRATCH_BUFSIZE];
 };
 
-static httpd_handle_t ws_server = NULL;
+static httpd_handle_t server = NULL;
 
-static const char *TAG = "antenna_switch";
+static const char *TAG = "file_server";
 
 #define IS_FILE_EXT(filename, ext) \
     (strcasecmp(&filename[strlen(filename) - sizeof(ext) + 1], ext) == 0)
@@ -97,27 +97,112 @@ static const char* get_path_from_uri(char *dest, const char *base_path, const ch
     return dest + base_pathlen;
 }
 
+/*
+ * Structure holding server handle
+ * and internal socket fd in order
+ * to use out of request send
+ */
+struct async_resp_arg {
+    httpd_handle_t hd;
+    int fd;
+    int ant_number;
+};
 
-esp_err_t httpd_ws_send_frame_to_all_clients(httpd_ws_frame_t *ws_pkt) {
-    // static const size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
-    // size_t fds = max_clients;
+
+// esp_err_t httpd_ws_send_frame_to_all_clients(httpd_ws_frame_t *ws_pkt) {
+//     // static const size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
+//     // size_t fds = max_clients;
+//     size_t fds = CONFIG_LWIP_MAX_LISTENING_TCP;
+//     int client_fds[CONFIG_LWIP_MAX_LISTENING_TCP] = {0};
+
+//     esp_err_t ret = httpd_get_client_list(ws_server, &fds, client_fds);
+
+//     if (ret != ESP_OK) {
+//         return ret;
+//     }
+
+//     for (int i = 0; i < fds; i++) {
+//         int client_info = httpd_ws_get_fd_info(ws_server, client_fds[i]);
+//         if (client_info == HTTPD_WS_CLIENT_WEBSOCKET) {
+//             ESP_LOGI(TAG, "Sending data to client");
+//             httpd_ws_send_frame_async(ws_server, client_fds[i], ws_pkt);
+//         }
+//     }
+
+//     return ESP_OK;
+// }
+
+static const char* ant1_str = "ant1";
+static const char* ant2_str = "ant2";
+static const char* ant3_str = "ant3";
+static const char* ant4_str = "ant4";
+
+/*
+ * async send function, which we put into the httpd work queue
+ */
+static void ws_async_send(void *arg)
+{
+    // static const char * data = "Async data";
+    struct async_resp_arg *resp_arg = arg;
+    httpd_handle_t hd = resp_arg->hd;
+    int fd = resp_arg->fd;
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    if(resp_arg->ant_number == 1){
+        ws_pkt.payload = (uint8_t*)ant1_str;
+        ws_pkt.len = strlen(ant1_str);
+    } else if(resp_arg->ant_number == 2)
+    {
+        ws_pkt.payload = (uint8_t*)ant2_str;
+        ws_pkt.len = strlen(ant2_str);
+    } else if(resp_arg->ant_number == 3)
+    {
+        ws_pkt.payload = (uint8_t*)ant3_str;
+        ws_pkt.len = strlen(ant3_str);
+    } else if(resp_arg->ant_number == 4)
+    {
+        ws_pkt.payload = (uint8_t*)ant4_str;
+        ws_pkt.len = strlen(ant4_str);
+    }
+
+    ESP_LOGI(TAG, "Response payload size %d", ws_pkt.len);
+    ESP_LOGI(TAG, "Sending back %s", (char*)ws_pkt.payload);
+        ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    httpd_ws_send_frame_async(hd, fd, &ws_pkt);
+    free(resp_arg);
+}
+
+static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req, int ant_number)
+{
     size_t fds = CONFIG_LWIP_MAX_LISTENING_TCP;
     int client_fds[CONFIG_LWIP_MAX_LISTENING_TCP] = {0};
 
-    esp_err_t ret = httpd_get_client_list(ws_server, &fds, client_fds);
+    esp_err_t ret = httpd_get_client_list(server, &fds, client_fds);
 
     if (ret != ESP_OK) {
         return ret;
     }
 
     for (int i = 0; i < fds; i++) {
-        int client_info = httpd_ws_get_fd_info(ws_server, client_fds[i]);
+        int client_info = httpd_ws_get_fd_info(server, client_fds[i]);
         if (client_info == HTTPD_WS_CLIENT_WEBSOCKET) {
-            httpd_ws_send_frame_async(ws_server, client_fds[i], ws_pkt);
+            ESP_LOGI(TAG, "Sending data to client");
+            struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+            if (resp_arg == NULL) {
+                return ESP_ERR_NO_MEM;
+            }
+            resp_arg->hd = req->handle;
+            resp_arg->fd = client_fds[i];
+            resp_arg->ant_number = ant_number;
+            esp_err_t ret = httpd_queue_work(handle, ws_async_send, resp_arg);
+            if (ret != ESP_OK) {
+                free(resp_arg);
+            }
         }
     }
 
-    return ESP_OK;
+    return ret;
 }
 
 /*
@@ -159,19 +244,34 @@ static esp_err_t echo_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "Got packet with message: %s", ws_pkt.payload);
     }
     ESP_LOGI(TAG, "Packet type: %d", ws_pkt.type);
-    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
-        strcmp((char*)ws_pkt.payload,"ant4") == 0) {
+    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT)
+    {
+        int ant_number = 0;
+        if(strcmp((char*)ws_pkt.payload,"ant1") == 0)
+        {
+            ant_number = 1;
+        } else if(strcmp((char*)ws_pkt.payload,"ant2") == 0)
+        {
+            ant_number = 2;
+        } else if(strcmp((char*)ws_pkt.payload,"ant3") == 0)
+        {
+            ant_number = 3;
+        } else if(strcmp((char*)ws_pkt.payload,"ant4") == 0)
+        {
+            ant_number = 4;
+        } 
         free(buf);
-        // return trigger
-        return httpd_ws_send_frame_to_all_clients(&ws_pkt);
-    }
 
-    ret = httpd_ws_send_frame(req, &ws_pkt);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_ws_send_frame failed with %d", ret);
+        if(ant_number != 0)
+        {
+            ESP_LOGI(TAG, "Sending back message");
+            return trigger_async_send(req->handle, req, ant_number);
+        } else 
+        {
+            return ESP_OK;
+        }
     }
-    free(buf);
-    return ret;
+    return ESP_OK;
 }
 
 /* Handler to download a file kept on the server */
@@ -183,6 +283,8 @@ static esp_err_t download_get_handler(httpd_req_t *req)
 
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
                                              req->uri, sizeof(filepath));
+
+    ESP_LOGI(TAG, "Request uri: %s", req->uri);
 
     if (!filename) {
         ESP_LOGE(TAG, "Filename is too long");
@@ -269,7 +371,7 @@ esp_err_t example_start_file_server(const char *base_path)
     strlcpy(server_data->base_path, base_path,
             sizeof(server_data->base_path));
 
-    httpd_handle_t server = NULL;
+        // httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
     /* Use the URI wildcard matching function in order to
@@ -284,26 +386,47 @@ esp_err_t example_start_file_server(const char *base_path)
     }
 
     /* URI handler for getting uploaded files */
-    httpd_uri_t file_download = {
-        .uri       = "/*",  // Match all URIs of type /path/to/file
+    httpd_uri_t home_download = {
+        .uri       = "/",  // Match all URIs of type /path/to/file
         .method    = HTTP_GET,
         .handler   = download_get_handler,
         .user_ctx  = server_data    // Pass server data as context
     };
 
-    httpd_register_uri_handler(server, &file_download);
+    /* URI handler for getting uploaded files */
+    httpd_uri_t file_download = {
+            .uri       = "/index.html",  // Match all URIs of type /path/to/file
+        .method    = HTTP_GET,
+        .handler   = download_get_handler,
+        .user_ctx  = server_data    // Pass server data as context
+    };
 
-    httpd_config_t ws_config = HTTPD_DEFAULT_CONFIG();
-    ws_config.ctrl_port = 114;
-    ws_config.server_port = 8083;
+    /* URI handler for getting uploaded files */
+    httpd_uri_t css_download = {
+        .uri       = "/style.css",  // Match all URIs of type /path/to/file
+        .method    = HTTP_GET,
+        .handler   = download_get_handler,
+        .user_ctx  = server_data    // Pass server data as context
+    };
 
-    ESP_LOGI(TAG, "Starting Websocket Server on port: '%d'", ws_config.server_port);
-    if (httpd_start(&ws_server, &ws_config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start websocket server!");
-        return ESP_FAIL;
-    }
+    /* URI handler for getting uploaded files */
+    httpd_uri_t js_download = {
+            .uri       = "/websocket.js",  // Match all URIs of type /path/to/file
+        .method    = HTTP_GET,
+        .handler   = download_get_handler,
+        .user_ctx  = server_data    // Pass server data as context
+    };
 
-    httpd_uri_t ws = {
+    /* URI handler for getting uploaded files */
+    httpd_uri_t ico_download = {
+        .uri       = "/*.ico",  // Match all URIs of type /path/to/file
+        .method    = HTTP_GET,
+        .handler   = download_get_handler,
+        .user_ctx  = server_data    // Pass server data as context
+    };
+
+    /* URI handler for the websocket connection */
+    static httpd_uri_t ws = {
         .uri        = "/ws",
         .method     = HTTP_GET,
         .handler    = echo_handler,
@@ -311,7 +434,12 @@ esp_err_t example_start_file_server(const char *base_path)
         .is_websocket = true
     };
 
-    httpd_register_uri_handler(ws_server, &ws);
-
+    httpd_register_uri_handler(server, &home_download);
+    httpd_register_uri_handler(server, &file_download);
+    httpd_register_uri_handler(server, &css_download);
+    httpd_register_uri_handler(server, &js_download);
+    httpd_register_uri_handler(server, &ico_download);
+    httpd_register_uri_handler(server, &ws);
+    
     return ESP_OK;
 }

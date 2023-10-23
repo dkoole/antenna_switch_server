@@ -25,11 +25,12 @@
  * Look in file_server.c for the implementation.
  */
 
-static const char *TAG = "example";
+static const char *TAG = "Atenna Switch Server";
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting example");
+    ESP_LOGI(TAG, "Starting Remote antenna switch Server");
+    esp_log_level_set("httpd", ESP_LOG_DEBUG);
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -47,4 +48,10 @@ void app_main(void)
     /* Start the file server */
     ESP_ERROR_CHECK(example_start_file_server(base_path));
     ESP_LOGI(TAG, "File server started");
+
+    // /* Start the websocket server */
+    // ESP_ERROR_CHECK(start_websocket_server());
+    // ESP_LOGI(TAG, "Websocket server started");
+
+
 }
