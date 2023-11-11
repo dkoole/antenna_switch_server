@@ -32,6 +32,8 @@
 /* Scratch buffer size */
 #define SCRATCH_BUFSIZE  8192
 
+static int current_ant_num = 1;
+
 struct file_server_data {
     /* Base path of file storage */
     char base_path[ESP_VFS_PATH_MAX + 1];
@@ -132,10 +134,10 @@ struct async_resp_arg {
 //     return ESP_OK;
 // }
 
-static const char* ant1_str = "ant1";
-static const char* ant2_str = "ant2";
-static const char* ant3_str = "ant3";
-static const char* ant4_str = "ant4";
+static const char* ant1_str = "1";
+static const char* ant2_str = "2";
+static const char* ant3_str = "3";
+static const char* ant4_str = "4";
 
 /*
  * async send function, which we put into the httpd work queue
@@ -173,7 +175,7 @@ static void ws_async_send(void *arg)
     free(resp_arg);
 }
 
-static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req, int ant_number)
+static esp_err_t trigger_async_send_all_clients(httpd_handle_t handle, httpd_req_t *req, int ant_number)
 {
     size_t fds = CONFIG_LWIP_MAX_LISTENING_TCP;
     int client_fds[CONFIG_LWIP_MAX_LISTENING_TCP] = {0};
@@ -204,6 +206,23 @@ static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req, int
 
     return ret;
 }
+
+static esp_err_t trigger_async_send_single_client(httpd_handle_t handle, httpd_req_t *req, int ant_number)
+{   
+    struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+    if (resp_arg == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    resp_arg->hd = req->handle;
+    resp_arg->fd = httpd_req_to_sockfd(req);
+    resp_arg->ant_number = ant_number;
+    esp_err_t ret = httpd_queue_work(handle, ws_async_send, resp_arg);
+    if (ret != ESP_OK) {
+        free(resp_arg);
+    }
+    return ret;
+}
+
 
 /*
  * This handler echos back the received ws data
@@ -246,30 +265,36 @@ static esp_err_t echo_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Packet type: %d", ws_pkt.type);
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT)
     {
-        int ant_number = 0;
-        if(strcmp((char*)ws_pkt.payload,"ant1") == 0)
+        if(strcmp((char*)ws_pkt.payload, "current_antenna") == 0)
         {
-            ant_number = 1;
-        } else if(strcmp((char*)ws_pkt.payload,"ant2") == 0)
-        {
-            ant_number = 2;
-        } else if(strcmp((char*)ws_pkt.payload,"ant3") == 0)
-        {
-            ant_number = 3;
-        } else if(strcmp((char*)ws_pkt.payload,"ant4") == 0)
-        {
-            ant_number = 4;
+            return trigger_async_send_single_client(req->handle, req, current_ant_num);
         } 
-        free(buf);
+        else {
+            if(strcmp((char*)ws_pkt.payload,"1") == 0)
+            {
+                current_ant_num = 1;
+            } else if(strcmp((char*)ws_pkt.payload,"2") == 0)
+            {
+                current_ant_num = 2;
+            } else if(strcmp((char*)ws_pkt.payload,"3") == 0)
+            {
+                current_ant_num = 3;
+            } else if(strcmp((char*)ws_pkt.payload,"4") == 0)
+            {
+                current_ant_num = 4;
+            } 
+            free(buf);
 
-        if(ant_number != 0)
-        {
-            ESP_LOGI(TAG, "Sending back message");
-            return trigger_async_send(req->handle, req, ant_number);
-        } else 
-        {
-            return ESP_OK;
+            if(current_ant_num != 0)
+            {
+                ESP_LOGI(TAG, "Sending back antenna to all clients");
+                return trigger_async_send_all_clients(req->handle, req, current_ant_num);
+            } else 
+            {
+                return ESP_OK;
+            }
         }
+
     }
     return ESP_OK;
 }
@@ -349,6 +374,23 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "close");
 #endif
     httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+esp_err_t on_connect(httpd_handle_t hd, int sockfd)
+{
+    ESP_LOGI(TAG, "Client connected, sending current antenna");
+    struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+    if (resp_arg == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    resp_arg->hd = hd;
+    resp_arg->fd = sockfd;
+    resp_arg->ant_number = current_ant_num;
+    esp_err_t ret = httpd_queue_work(hd, ws_async_send, resp_arg);
+    if(ret != ESP_OK){ 
+        free(resp_arg);
+    }
     return ESP_OK;
 }
 
